@@ -1,59 +1,46 @@
+# NOTE: Ce script nécessite que le module 'streamlit' soit installé dans votre environnement Python.
+# Installez-le avec : pip install streamlit
+
 import streamlit as st
 import pandas as pd
 import requests
 import base64
 from datetime import datetime, timedelta
+from collections import defaultdict
 
-# URL DHIS2
+st.set_page_config(page_title="DHIS2 - Utilisateurs par unité", layout="wide")
+
+# URL DHIS2 fixe
 dhis2_url = "https://togo.dhis2.org/dhis"
 
-st.set_page_config(page_title="DHIS2 - Utilisateurs et Unités d'Organisation", layout="wide")
-
-# Onglet Connexion
+# Connexion utilisateur
 st.sidebar.header("🔐 Connexion à DHIS2")
 username = st.sidebar.text_input("Nom d'utilisateur", type="default")
 password = st.sidebar.text_input("Mot de passe", type="password")
 
-# Authentification de base
+@st.cache_data(show_spinner=False)
 def get_auth_header(username, password):
     token = f"{username}:{password}"
     encoded = base64.b64encode(token.encode()).decode("utf-8")
     return {"Authorization": f"Basic {encoded}"}
 
-# Obtenir les unités d'organisation
-def get_organisation_units(base_url, headers):
+@st.cache_data(show_spinner=False)
+def get_org_units(base_url, headers):
     url = f"{base_url}/api/organisationUnits.json"
-    params = {"paging": "false", "fields": "id,name,level,parent[id,name]"}
+    params = {"paging": "false", "fields": "id,name,level,parent[id]"}
     r = requests.get(url, headers=headers, params=params)
-    try:
-        r.raise_for_status()
-        data = r.json()
-        return data.get("organisationUnits", [])
-    except Exception as e:
-        st.error(f"Erreur lors de la récupération des unités d'organisation : {e}")
-        return []
+    r.raise_for_status()
+    return r.json().get("organisationUnits", [])
 
-# Obtenir les utilisateurs
-def get_users(base_url, headers, org_unit_id):
+@st.cache_data(show_spinner=False)
+def get_all_users(base_url, headers):
     url = f"{base_url}/api/users.json"
-    params = {
-        "paging": "false",
-        "fields": "id,username,name,organisationUnits[id,name]"
-    }
+    params = {"paging": "false", "fields": "id,username,name,organisationUnits[id]"}
     r = requests.get(url, headers=headers, params=params)
-    if r.status_code != 200:
-        st.error("Erreur lors de la récupération des utilisateurs.")
-        return []
-    users = r.json().get("users", [])
-    # Filtrer par unité d'organisation
-    filtered = []
-    for user in users:
-        user_ous = [ou['id'] for ou in user.get('organisationUnits', [])]
-        if org_unit_id in user_ous:
-            filtered.append(user)
-    return filtered
+    r.raise_for_status()
+    return r.json().get("users", [])
 
-# Obtenir les connexions des utilisateurs (audit)
+@st.cache_data(show_spinner=False)
 def get_user_logins(base_url, headers):
     url = f"{base_url}/api/userCredentials?fields=username,lastLogin&paging=false"
     r = requests.get(url, headers=headers)
@@ -62,71 +49,78 @@ def get_user_logins(base_url, headers):
     else:
         return []
 
+def build_org_tree(units):
+    id_to_unit = {u['id']: u for u in units}
+    children = defaultdict(list)
+    for unit in units:
+        parent_id = unit.get('parent', {}).get('id')
+        if parent_id:
+            children[parent_id].append(unit['id'])
+    return id_to_unit, children
+
+def assign_users_to_units(users):
+    unit_to_users = defaultdict(list)
+    for user in users:
+        for ou in user.get('organisationUnits', []):
+            unit_to_users[ou['id']].append(user)
+    return unit_to_users
+
+def aggregate_users(unit_id, children_map, unit_to_users, aggregated):
+    users = unit_to_users.get(unit_id, []).copy()
+    for child_id in children_map.get(unit_id, []):
+        users.extend(aggregate_users(child_id, children_map, unit_to_users, aggregated))
+    aggregated[unit_id] = users
+    return users
+
 if username and password:
     headers = get_auth_header(username, password)
+    st.success("Connexion réussie à DHIS2")
 
-    st.sidebar.subheader("🏥 Sélection de l'unité d'organisation")
-    units = get_organisation_units(dhis2_url, headers)
-    unit_options = {unit['name']: unit['id'] for unit in units if unit['level'] >= 5}
+    units = get_org_units(dhis2_url, headers)
+    users = get_all_users(dhis2_url, headers)
+    user_logins = get_user_logins(dhis2_url, headers)
 
-    if unit_options:
-        selected_name = st.sidebar.selectbox("Choisir une unité", list(unit_options.keys()))
-        selected_id = unit_options[selected_name]
+    login_map = {u['username']: u.get('lastLogin') for u in user_logins}
 
-        if st.sidebar.button("📥 Charger les utilisateurs"):
-            st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
-            users = get_users(dhis2_url, headers, selected_id)
+    id_to_unit, children_map = build_org_tree(units)
+    unit_to_users = assign_users_to_units(users)
 
-            if users:
-                df_users = pd.DataFrame(users)
-                df_users = df_users[['id', 'username', 'name']]
+    aggregated_users = {}
+    root_ids = [u['id'] for u in units if u.get('level') == 1]
+    for root_id in root_ids:
+        aggregate_users(root_id, children_map, unit_to_users, aggregated_users)
 
-                # Marquer les doublons
-                df_users['doublon'] = df_users.duplicated(subset='name', keep=False)
-                df_users['doublon'] = df_users['doublon'].apply(lambda x: "Oui" if x else "Non")
+    export_rows = []
+    for unit_id, users in aggregated_users.items():
+        unit = id_to_unit[unit_id]
+        for user in users:
+            export_rows.append({
+                "Unité d'organisation": unit['name'],
+                "Niveau": unit['level'],
+                "Nom utilisateur": user['name'],
+                "Nom de connexion": user['username'],
+                "Dernière connexion": login_map.get(user['username'])
+            })
 
-                st.success(f"✅ {len(df_users)} utilisateurs trouvés.")
-                st.dataframe(df_users, use_container_width=True)
+    df_export = pd.DataFrame(export_rows)
+    df_export['Dernière connexion'] = pd.to_datetime(df_export['Dernière connexion'], errors='coerce')
 
-                csv = df_users.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📄 Télécharger la liste CSV",
-                    data=csv,
-                    file_name="utilisateurs_dhis2.csv",
-                    mime='text/csv'
-                )
-            else:
-                st.warning("Aucun utilisateur trouvé pour cette unité.")
+    st.subheader("📄 Liste des utilisateurs par unité d'organisation (niveau 5 à 1)")
+    st.dataframe(df_export, use_container_width=True)
 
-    # Partie Audit
-    st.sidebar.subheader("📊 Période d'analyse des connexions")
-    start_date = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
-    end_date = st.sidebar.date_input("Fin", datetime.today())
+    csv = df_export.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📁 Télécharger les utilisateurs (CSV)",
+        data=csv,
+        file_name="utilisateurs_dhis2_par_unite.csv",
+        mime='text/csv'
+    )
 
-    if start_date > end_date:
-        st.sidebar.error("La date de début doit être antérieure à la date de fin.")
-    elif st.sidebar.button("📈 Analyser l'activité"):
-        st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
-        data = get_user_logins(dhis2_url, headers)
-        df = pd.DataFrame(data)
-        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+    # Résumé des effectifs
+    st.subheader("📊 Résumé par niveau d'organisation")
+    resume = df_export.groupby('Niveau')["Nom utilisateur"].count().reset_index()
+    resume.columns = ["Niveau", "Nombre d'utilisateurs"]
+    st.dataframe(resume)
 
-        df['Actif durant la période'] = df['lastLogin'].apply(
-            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
-        )
-
-        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
-
-        filtered = df[df["Actif durant la période"] == "Oui"]
-        if not filtered.empty:
-            excel_data = filtered.to_excel(index=False, engine='openpyxl')
-            st.download_button(
-                "📤 Exporter les actifs (Excel)",
-                data=excel_data,
-                file_name="utilisateurs_actifs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.info("Aucun utilisateur actif trouvé durant la période.")
 else:
-    st.warning("Veuillez renseigner vos identifiants DHIS2 pour commencer.")
+    st.warning("Veuillez vous connecter à DHIS2 pour commencer.")
