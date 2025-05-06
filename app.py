@@ -1,3 +1,6 @@
+# NOTE: Ce script nécessite que le module 'streamlit' soit installé dans votre environnement Python.
+# Installez-le avec : pip install streamlit
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -6,27 +9,36 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="DHIS2 - Doublons & Audit", layout="wide")
 
+# URL DHIS2 fixe (mise à jour)
+dhis2_url = "https://togo.dhis2.org/dhis/dhis"
+
 # Onglet Connexion
 st.sidebar.header("🔐 Connexion à DHIS2")
-dhis2_url = st.sidebar.text_input("URL DHIS2", value="https://ton_instance.dhis2.org/dhis")
 username = st.sidebar.text_input("Nom d'utilisateur", type="default")
 password = st.sidebar.text_input("Mot de passe", type="password")
 
+# Authentification de base
 @st.cache_data(show_spinner=False)
 def get_auth_header(username, password):
     token = f"{username}:{password}"
     encoded = base64.b64encode(token.encode()).decode("utf-8")
     return {"Authorization": f"Basic {encoded}"}
 
+# Obtenir les unités d'organisation
 @st.cache_data(show_spinner=False)
 def get_organisation_units(base_url, headers):
     url = f"{base_url}/api/organisationUnits.json"
     params = {"paging": "false", "fields": "id,name"}
     r = requests.get(url, headers=headers, params=params)
-    if r.status_code == 200:
-        return r.json().get("organisationUnits", [])
-    return []
+    try:
+        r.raise_for_status()
+        data = r.json()
+        return data.get("organisationUnits", [])
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des unités d'organisation : {e}")
+        return []
 
+# Obtenir les utilisateurs
 def get_users(base_url, headers, org_unit_id):
     url = f"{base_url}/api/users.json"
     params = {
@@ -38,6 +50,7 @@ def get_users(base_url, headers, org_unit_id):
         st.error("Erreur lors de la récupération des utilisateurs.")
         return []
     users = r.json().get("users", [])
+    # Filtrer par unité d'organisation
     filtered = []
     for user in users:
         user_ous = [ou['id'] for ou in user.get('organisationUnits', [])]
@@ -45,31 +58,17 @@ def get_users(base_url, headers, org_unit_id):
             filtered.append(user)
     return filtered
 
+# Obtenir les connexions des utilisateurs (audit)
 @st.cache_data(show_spinner=False)
 def get_user_logins(base_url, headers):
-    url1 = f"{base_url}/api/userCredentials.json?fields=username,lastLogin&paging=false"
-    r1 = requests.get(url1, headers=headers)
-    if r1.status_code == 200:
-        data = r1.json().get("userCredentials", [])
-        if any("lastLogin" in user for user in data):
-            return data
+    url = f"{base_url}/api/userCredentials?fields=username,lastLogin&paging=false"
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json().get("userCredentials", [])
     else:
-        st.warning(f"Erreur avec userCredentials: {r1.status_code} - {r1.text}")
-
-    url2 = f"{base_url}/api/users.json?fields=username,lastLogin&paging=false"
-    r2 = requests.get(url2, headers=headers)
-    if r2.status_code == 200:
-        data = r2.json().get("users", [])
-        if any("lastLogin" in user for user in data):
-            return data
-        else:
-            st.warning("Aucune information de connexion (lastLogin) trouvée dans les utilisateurs.")
-            return []
-    else:
-        st.error(f"Erreur avec /users: {r2.status_code} - {r2.text}")
         return []
 
-if username and password and dhis2_url:
+if username and password:
     headers = get_auth_header(username, password)
 
     st.sidebar.subheader("🏥 Sélection de l'unité d'organisation")
@@ -87,6 +86,8 @@ if username and password and dhis2_url:
             if users:
                 df_users = pd.DataFrame(users)
                 df_users = df_users[['id', 'username', 'name']]
+
+                # Marquer les doublons
                 df_users['doublon'] = df_users.duplicated(subset='name', keep=False)
                 df_users['doublon'] = df_users['doublon'].apply(lambda x: "Oui" if x else "Non")
 
@@ -103,6 +104,7 @@ if username and password and dhis2_url:
             else:
                 st.warning("Aucun utilisateur trouvé pour cette unité.")
 
+    # Partie Audit
     st.sidebar.subheader("📊 Période d'analyse des connexions")
     start_date = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
     end_date = st.sidebar.date_input("Fin", datetime.today())
@@ -113,12 +115,8 @@ if username and password and dhis2_url:
         st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
         data = get_user_logins(dhis2_url, headers)
         df = pd.DataFrame(data)
-
-        if df.empty or 'lastLogin' not in df.columns:
-            st.warning("Aucune donnée d'audit disponible ou champ 'lastLogin' manquant.")
-            st.stop()
-
         df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+
         df['Actif durant la période'] = df['lastLogin'].apply(
             lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
         )
