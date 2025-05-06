@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="DHIS2 - Doublons & Audit", layout="wide")
 
-# URL DHIS2 fixe (mise à jour)
-dhis2_url = "https://togo.dhis2.org/dhis/dhis"
+# URL DHIS2 fixe corrigée
+dhis2_url = "https://togo.dhis2.org/dhis"
 
 # Onglet Connexion
 st.sidebar.header("🔐 Connexion à DHIS2")
