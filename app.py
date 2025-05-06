@@ -28,7 +28,7 @@ def get_auth_header(username, password):
 @st.cache_data(show_spinner=False)
 def get_organisation_units(base_url, headers):
     url = f"{base_url}/api/organisationUnits.json"
-    params = {"paging": "false", "fields": "id,name"}
+    params = {"paging": "false", "fields": "id,name,level,parent[id]"}
     r = requests.get(url, headers=headers, params=params)
     try:
         r.raise_for_status()
@@ -39,7 +39,8 @@ def get_organisation_units(base_url, headers):
         return []
 
 # Obtenir les utilisateurs
-def get_users(base_url, headers, org_unit_id):
+@st.cache_data(show_spinner=False)
+def get_all_users(base_url, headers):
     url = f"{base_url}/api/users.json"
     params = {
         "paging": "false",
@@ -49,14 +50,7 @@ def get_users(base_url, headers, org_unit_id):
     if r.status_code != 200:
         st.error("Erreur lors de la récupération des utilisateurs.")
         return []
-    users = r.json().get("users", [])
-    # Filtrer par unité d'organisation
-    filtered = []
-    for user in users:
-        user_ous = [ou['id'] for ou in user.get('organisationUnits', [])]
-        if org_unit_id in user_ous:
-            filtered.append(user)
-    return filtered
+    return r.json().get("users", [])
 
 # Obtenir les connexions des utilisateurs (audit)
 @st.cache_data(show_spinner=False)
@@ -81,13 +75,18 @@ if username and password:
 
         if st.sidebar.button("📥 Charger les utilisateurs"):
             st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
-            users = get_users(dhis2_url, headers, selected_id)
+            users = get_all_users(dhis2_url, headers)
 
-            if users:
-                df_users = pd.DataFrame(users)
+            filtered_users = []
+            for user in users:
+                for ou in user.get("organisationUnits", []):
+                    if ou['id'] == selected_id:
+                        filtered_users.append(user)
+                        break
+
+            if filtered_users:
+                df_users = pd.DataFrame(filtered_users)
                 df_users = df_users[['id', 'username', 'name']]
-
-                # Marquer les doublons
                 df_users['doublon'] = df_users.duplicated(subset='name', keep=False)
                 df_users['doublon'] = df_users['doublon'].apply(lambda x: "Oui" if x else "Non")
 
@@ -104,7 +103,6 @@ if username and password:
             else:
                 st.warning("Aucun utilisateur trouvé pour cette unité.")
 
-    # Partie Audit
     st.sidebar.subheader("📊 Période d'analyse des connexions")
     start_date = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
     end_date = st.sidebar.date_input("Fin", datetime.today())
@@ -115,24 +113,74 @@ if username and password:
         st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
         data = get_user_logins(dhis2_url, headers)
         df = pd.DataFrame(data)
-        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
 
-        df['Actif durant la période'] = df['lastLogin'].apply(
-            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
-        )
+        if "lastLogin" in df.columns:
+            df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
 
-        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+            df['Actif durant la période'] = df['lastLogin'].apply(
+                lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
+            )
 
-        filtered = df[df["Actif durant la période"] == "Oui"]
-        if not filtered.empty:
-            excel_data = filtered.to_excel(index=False, engine='openpyxl')
+            st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+
+            filtered = df[df["Actif durant la période"] == "Oui"]
+            if not filtered.empty:
+                excel_data = filtered.to_excel(index=False, engine='openpyxl')
+                st.download_button(
+                    "📤 Exporter les actifs (Excel)",
+                    data=excel_data,
+                    file_name="utilisateurs_actifs.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.info("Aucun utilisateur actif trouvé durant la période.")
+        else:
+            st.warning("Aucune donnée de connexion trouvée.")
+
+    # Export complet depuis le niveau 5
+    if st.sidebar.button("📦 Export utilisateurs du niveau 5 et plus"):
+        st.subheader("📋 Export des utilisateurs (niveaux ≥ 5, regroupés par niveau)")
+        all_units = get_organisation_units(dhis2_url, headers)
+        all_users = get_all_users(dhis2_url, headers)
+
+        unit_dict = {u['id']: u for u in all_units}
+        level_map = {lvl: {} for lvl in range(5, 1-1, -1)}  # niveaux de 5 à 1
+
+        for user in all_users:
+            for ou in user.get('organisationUnits', []):
+                ou_id = ou['id']
+                current = unit_dict.get(ou_id)
+
+                while current and current['level'] >= 5:
+                    lvl = current['level']
+                    if current['id'] not in level_map[lvl]:
+                        level_map[lvl][current['id']] = {
+                            'name': current['name'],
+                            'users': []
+                        }
+                    level_map[lvl][current['id']]['users'].append({
+                        "Nom complet": user.get("name"),
+                        "Nom d'utilisateur": user.get("username"),
+                        "ID utilisateur": user.get("id"),
+                        "Unité initiale": ou_id
+                    })
+                    parent_id = current.get('parent', {}).get('id')
+                    current = unit_dict.get(parent_id)
+
+        with pd.ExcelWriter("export_utilisateurs_niveaux.xlsx", engine='openpyxl') as writer:
+            for lvl in sorted(level_map.keys()):
+                for uid, info in level_map[lvl].items():
+                    if info['users']:
+                        df = pd.DataFrame(info['users'])
+                        nom_feuille = f"N{lvl}_{info['name'][:25]}"
+                        df.to_excel(writer, sheet_name=nom_feuille, index=False)
+
+        with open("export_utilisateurs_niveaux.xlsx", "rb") as f:
             st.download_button(
-                "📤 Exporter les actifs (Excel)",
-                data=excel_data,
-                file_name="utilisateurs_actifs.xlsx",
+                label="📥 Télécharger l'export utilisateurs par niveau",
+                data=f.read(),
+                file_name="utilisateurs_par_niveau.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.info("Aucun utilisateur actif trouvé durant la période.")
 else:
     st.warning("Veuillez renseigner vos identifiants DHIS2 pour commencer.")
