@@ -1,97 +1,132 @@
 import streamlit as st
-import requests
 import pandas as pd
-from requests.auth import HTTPBasicAuth
+import requests
+import base64
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Utilisateurs DHIS2 par unité d'organisation", layout="wide")
+# URL DHIS2
+dhis2_url = "https://togo.dhis2.org/dhis"
 
-st.title("📊 Export des utilisateurs DHIS2 par unité d'organisation (du niveau 5 au niveau 1)")
+st.set_page_config(page_title="DHIS2 - Utilisateurs et Unités d'Organisation", layout="wide")
 
-# Connexion à DHIS2
-with st.sidebar:
-    st.header("🔐 Connexion DHIS2")
-    dhis2_url = st.text_input("URL de DHIS2", value="https://play.dhis2.org/40.0.3", help="Ex: https://instance.dhis2.org")
-    username = st.text_input("Nom d'utilisateur", value="admin", type="default")
-    password = st.text_input("Mot de passe", value="district", type="password")
+# Onglet Connexion
+st.sidebar.header("🔐 Connexion à DHIS2")
+username = st.sidebar.text_input("Nom d'utilisateur", type="default")
+password = st.sidebar.text_input("Mot de passe", type="password")
 
+# Authentification de base
 def get_auth_header(username, password):
-    return {"Authorization": f"Basic {requests.auth._basic_auth_str(username, password).split(' ')[1]}"}
+    token = f"{username}:{password}"
+    encoded = base64.b64encode(token.encode()).decode("utf-8")
+    return {"Authorization": f"Basic {encoded}"}
 
-@st.cache_data(show_spinner=False)
-def get_full_org_units(base_url, headers):
+# Obtenir les unités d'organisation
+def get_organisation_units(base_url, headers):
     url = f"{base_url}/api/organisationUnits.json"
-    params = {
-        "paging": "false",
-        "fields": "id,name,level,parent[id]"
-    }
+    params = {"paging": "false", "fields": "id,name,level,parent[id,name]"}
     r = requests.get(url, headers=headers, params=params)
-    r.raise_for_status()
-    return r.json().get("organisationUnits", [])
+    try:
+        r.raise_for_status()
+        data = r.json()
+        return data.get("organisationUnits", [])
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des unités d'organisation : {e}")
+        return []
 
-def build_hierarchy(units):
-    children_map = {}
-    id_map = {u["id"]: u for u in units}
-    for u in units:
-        parent_id = u.get("parent", {}).get("id")
-        if parent_id:
-            children_map.setdefault(parent_id, []).append(u["id"])
-    return children_map, id_map
-
-@st.cache_data(show_spinner=False)
-def get_all_users(base_url, headers):
+# Obtenir les utilisateurs
+def get_users(base_url, headers, org_unit_id):
     url = f"{base_url}/api/users.json"
     params = {
         "paging": "false",
-        "fields": "id,username,name,organisationUnits[id]"
+        "fields": "id,username,name,organisationUnits[id,name]"
     }
     r = requests.get(url, headers=headers, params=params)
-    r.raise_for_status()
-    return r.json().get("users", [])
-
-def aggregate_users_by_unit(units, users, children_map):
-    user_map = {u["id"]: {"username": u["username"], "name": u["name"], "organisationUnits": [ou["id"] for ou in u.get("organisationUnits", [])]} for u in users}
-    users_per_unit = {u["id"]: [] for u in units}
-
+    if r.status_code != 200:
+        st.error("Erreur lors de la récupération des utilisateurs.")
+        return []
+    users = r.json().get("users", [])
+    # Filtrer par unité d'organisation
+    filtered = []
     for user in users:
-        for ou in user.get("organisationUnits", []):
-            users_per_unit[ou["id"]].append(user)
+        user_ous = [ou['id'] for ou in user.get('organisationUnits', [])]
+        if org_unit_id in user_ous:
+            filtered.append(user)
+    return filtered
 
-    def gather_users(unit_id):
-        all_users = list(users_per_unit.get(unit_id, []))
-        for child_id in children_map.get(unit_id, []):
-            all_users.extend(gather_users(child_id))
-        return all_users
+# Obtenir les connexions des utilisateurs (audit)
+def get_user_logins(base_url, headers):
+    url = f"{base_url}/api/userCredentials?fields=username,lastLogin&paging=false"
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json().get("userCredentials", [])
+    else:
+        return []
 
-    return {unit["id"]: gather_users(unit["id"]) for unit in units}
-
-if username and password and dhis2_url:
+if username and password:
     headers = get_auth_header(username, password)
 
-    st.header("👥 Utilisateurs par unité d'organisation (de la FOSA au niveau national)")
+    st.sidebar.subheader("🏥 Sélection de l'unité d'organisation")
+    units = get_organisation_units(dhis2_url, headers)
+    unit_options = {unit['name']: unit['id'] for unit in units if unit['level'] >= 5}
 
-    with st.spinner("Chargement des données..."):
-        try:
-            units = get_full_org_units(dhis2_url, headers)
-            children_map, id_map = build_hierarchy(units)
-            users = get_all_users(dhis2_url, headers)
-            aggregated = aggregate_users_by_unit(units, users, children_map)
-        except Exception as e:
-            st.error(f"Erreur lors de la récupération des données : {e}")
-            st.stop()
+    if unit_options:
+        selected_name = st.sidebar.selectbox("Choisir une unité", list(unit_options.keys()))
+        selected_id = unit_options[selected_name]
 
-    units_from_level5 = [u for u in units if u["level"] >= 5]
+        if st.sidebar.button("📥 Charger les utilisateurs"):
+            st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
+            users = get_users(dhis2_url, headers, selected_id)
 
-    for unit in sorted(units_from_level5, key=lambda x: (x["level"], x["name"])):
-        users_for_unit = aggregated.get(unit["id"], [])
-        if users_for_unit:
-            st.subheader(f"📍 {unit['name']} (Niveau {unit['level']}) - {len(users_for_unit)} utilisateurs")
-            df = pd.DataFrame(users_for_unit)[["username", "name"]]
-            st.dataframe(df, use_container_width=True)
+            if users:
+                df_users = pd.DataFrame(users)
+                df_users = df_users[['id', 'username', 'name']]
 
-            csv = df.to_csv(index=False).encode('utf-8')
+                # Marquer les doublons
+                df_users['doublon'] = df_users.duplicated(subset='name', keep=False)
+                df_users['doublon'] = df_users['doublon'].apply(lambda x: "Oui" if x else "Non")
+
+                st.success(f"✅ {len(df_users)} utilisateurs trouvés.")
+                st.dataframe(df_users, use_container_width=True)
+
+                csv = df_users.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📄 Télécharger la liste CSV",
+                    data=csv,
+                    file_name="utilisateurs_dhis2.csv",
+                    mime='text/csv'
+                )
+            else:
+                st.warning("Aucun utilisateur trouvé pour cette unité.")
+
+    # Partie Audit
+    st.sidebar.subheader("📊 Période d'analyse des connexions")
+    start_date = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
+    end_date = st.sidebar.date_input("Fin", datetime.today())
+
+    if start_date > end_date:
+        st.sidebar.error("La date de début doit être antérieure à la date de fin.")
+    elif st.sidebar.button("📈 Analyser l'activité"):
+        st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
+        data = get_user_logins(dhis2_url, headers)
+        df = pd.DataFrame(data)
+        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+
+        df['Actif durant la période'] = df['lastLogin'].apply(
+            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
+        )
+
+        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+
+        filtered = df[df["Actif durant la période"] == "Oui"]
+        if not filtered.empty:
+            excel_data = filtered.to_excel(index=False, engine='openpyxl')
             st.download_button(
-                label=f"📄 Télécharger - {unit['name']}",
-                data=csv,
-                file_name=f"utilisateurs_{unit['name'].replace(' ', '_')}.csv",
-                mime='text/csv'
+                "📤 Exporter les actifs (Excel)",
+                data=excel_data,
+                file_name="utilisateurs_actifs.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+        else:
+            st.info("Aucun utilisateur actif trouvé durant la période.")
+else:
+    st.warning("Veuillez renseigner vos identifiants DHIS2 pour commencer.")
