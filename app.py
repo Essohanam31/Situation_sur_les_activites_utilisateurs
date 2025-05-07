@@ -6,6 +6,7 @@ import pandas as pd
 import requests
 import base64
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 st.set_page_config(page_title="DHIS2 - Doublons & Audit", layout="wide")
 
@@ -40,7 +41,7 @@ def get_descendants(base_url, headers, org_unit_id):
 @st.cache_data(show_spinner=False)
 def get_organisation_units(base_url, headers):
     url = f"{base_url}/api/organisationUnits.json"
-    params = {"paging": "false", "fields": "id,name"}
+    params = {"paging": "false", "fields": "id,name,parent[id]"}
     r = requests.get(url, headers=headers, params=params)
     try:
         r.raise_for_status()
@@ -72,6 +73,18 @@ def get_user_logins(base_url, headers):
         return r.json().get("userCredentials", [])
     else:
         return []
+
+# Construire la hiérarchie ascendante des unités
+def build_ou_hierarchy(units):
+    hierarchy = defaultdict(list)
+    lookup = {unit['id']: unit for unit in units}
+    for unit in units:
+        current = unit
+        while 'parent' in current and current['parent'] and current['parent']['id'] in lookup:
+            parent_id = current['parent']['id']
+            hierarchy[unit['id']].append(parent_id)
+            current = lookup[parent_id]
+    return hierarchy
 
 if username and password:
     headers = get_auth_header(username, password)
@@ -132,7 +145,7 @@ if username and password:
         users_data = get_users(dhis2_url, headers)
         logins_data = get_user_logins(dhis2_url, headers)
 
-        df_users = pd.DataFrame(users_data)[['username', 'name']]
+        df_users = pd.DataFrame(users_data)[['id', 'username', 'name', 'organisationUnits']]
         df_logins = pd.DataFrame(logins_data)[['username', 'lastLogin']]
 
         df = pd.merge(df_users, df_logins, on='username', how='left')
@@ -141,42 +154,55 @@ if username and password:
         df['Actif durant la période'] = df['lastLogin'].apply(
             lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
         )
-
         df['Jamais connecté'] = df['lastLogin'].isna().map({True: "Oui", False: "Non"})
 
-        nb_connus = df['lastLogin'].notnull().sum()
-        st.write(f"🔢 Nombre d'utilisateurs avec une date de connexion connue : {nb_connus}")
+        hierarchy = build_ou_hierarchy(units)
 
+        region_totals = defaultdict(lambda: {'Total': 0, 'Actifs': 0, 'Jamais connectés': 0})
+        for _, row in df.iterrows():
+            assigned_ous = [ou['id'] for ou in row['organisationUnits']]
+            ou_set = set(assigned_ous)
+            for ou in assigned_ous:
+                ou_set.update(hierarchy.get(ou, []))
+            for ou_id in ou_set:
+                region_totals[ou_id]['Total'] += 1
+                if row['Actif durant la période'] == "Oui":
+                    region_totals[ou_id]['Actifs'] += 1
+                if row['Jamais connecté'] == "Oui":
+                    region_totals[ou_id]['Jamais connectés'] += 1
+
+        st.write(f"🔢 Nombre d'utilisateurs avec une date de connexion connue : {df['lastLogin'].notnull().sum()}")
         st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
 
-        actifs = df[df["Actif durant la période"] == "Oui"]
-        jamais_connectes = df[df["Jamais connecté"] == "Oui"]
+        if region_totals:
+            st.write("\n### 🧾 Résumé par unité d'organisation (hiérarchie cumulée)")
+            summary_data = []
+            for ou_id, metrics in region_totals.items():
+                name = next((unit['name'] for unit in units if unit['id'] == ou_id), ou_id)
+                summary_data.append({
+                    "Unité d'organisation": name,
+                    "Utilisateurs totaux": metrics['Total'],
+                    "Actifs": metrics['Actifs'],
+                    "Jamais connectés": metrics['Jamais connectés']
+                })
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 
         col1, col2 = st.columns(2)
-
         with col1:
             st.write("### 📤 Export utilisateurs actifs")
+            actifs = df[df["Actif durant la période"] == "Oui"]
             if not actifs.empty:
                 csv_actifs = actifs.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Télécharger les actifs",
-                    data=csv_actifs,
-                    file_name="utilisateurs_actifs.csv",
-                    mime="text/csv"
-                )
+                st.download_button("📥 Télécharger les actifs", data=csv_actifs, file_name="utilisateurs_actifs.csv", mime="text/csv")
             else:
                 st.info("Aucun utilisateur actif trouvé durant la période.")
 
         with col2:
             st.write("### 🚫 Export jamais connectés")
+            jamais_connectes = df[df["Jamais connecté"] == "Oui"]
             if not jamais_connectes.empty:
                 csv_jamais = jamais_connectes.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Télécharger les jamais connectés",
-                    data=csv_jamais,
-                    file_name="utilisateurs_jamais_connectes.csv",
-                    mime="text/csv"
-                )
+                st.download_button("📥 Télécharger les jamais connectés", data=csv_jamais, file_name="utilisateurs_jamais_connectes.csv", mime="text/csv")
             else:
                 st.info("Tous les utilisateurs se sont déjà connectés au moins une fois.")
 else:
