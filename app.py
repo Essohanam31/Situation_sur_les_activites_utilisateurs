@@ -84,7 +84,7 @@ if username and password:
         selected_name = st.sidebar.selectbox("Choisir une unité", list(unit_options.keys()))
         selected_id = unit_options[selected_name]
 
-        if st.sidebar.button("📅 Charger les utilisateurs"):
+        if st.sidebar.button("📥 Charger les utilisateurs"):
             st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
             all_users = get_users(dhis2_url, headers)
             descendant_ids = get_descendants(dhis2_url, headers, selected_id)
@@ -131,28 +131,31 @@ if username and password:
         data = get_user_logins(dhis2_url, headers)
         df = pd.DataFrame(data)
 
-        # Correction ici : s'assurer que 'lastLogin' existe
+        # Vérification existence de la colonne 'lastLogin'
         if 'lastLogin' not in df.columns:
-            df['lastLogin'] = pd.NaT
-
-        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
-
-        df['Actif durant la période'] = df['lastLogin'].apply(
-            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
-        )
-
-        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
-
-        filtered = df[df["Actif durant la période"] == "Oui"]
-        if not filtered.empty:
-            excel_data = filtered.to_excel(index=False, engine='openpyxl')
-            st.download_button(
-                "📄 Exporter les actifs (Excel)",
-                data=excel_data,
-                file_name="utilisateurs_actifs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            st.warning("Aucune donnée de connexion disponible (lastLogin manquant).")
         else:
-            st.info("Aucun utilisateur actif trouvé durant la période.")
+            df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+
+            df['Actif durant la période'] = df['lastLogin'].apply(
+                lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
+            )
+
+            nb_connus = df['lastLogin'].notnull().sum()
+            st.write(f"🔢 Nombre d'utilisateurs avec une date de connexion connue : {nb_connus}")
+
+            st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+
+            filtered = df[df["Actif durant la période"] == "Oui"]
+            if not filtered.empty:
+                excel_data = filtered.to_excel(index=False, engine='openpyxl')
+                st.download_button(
+                    "📤 Exporter les actifs (Excel)",
+                    data=excel_data,
+                    file_name="utilisateurs_actifs.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.info("Aucun utilisateur actif trouvé durant la période.")
 else:
     st.warning("Veuillez renseigner vos identifiants DHIS2 pour commencer.")
