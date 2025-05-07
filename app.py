@@ -1,149 +1,100 @@
 import streamlit as st
 import pandas as pd
 import requests
-import base64
 from collections import defaultdict
-from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Audit DHIS2 - Utilisateurs par Unité", layout="wide")
+st.set_page_config(page_title="🧭 Rapport Utilisateurs DHIS2", layout="wide")
+st.title("📊 Rapport des Utilisateurs DHIS2 par Niveau d'Organisation")
 
-# URL DHIS2
+# --- Connexion DHIS2 ---
+st.sidebar.header("🔐 Connexion DHIS2")
 dhis2_url = "https://togo.dhis2.org/dhis"
+pat = st.sidebar.text_input("Token d'accès personnel (PAT)", type="password")
 
-# Connexion
-st.sidebar.header("🔐 Connexion à DHIS2")
-username = st.sidebar.text_input("Nom d'utilisateur")
-password = st.sidebar.text_input("Mot de passe", type="password")
+headers = {"Authorization": f"ApiToken {pat}"}
 
-@st.cache_data(show_spinner=False)
-def get_auth_header(username, password):
-    token = f"{username}:{password}"
-    encoded = base64.b64encode(token.encode()).decode("utf-8")
-    return {"Authorization": f"Basic {encoded}"}
+# --- Récupération des unités d'organisation ---
+@st.cache_data(ttl=3600)
+def get_org_units():
+    units = []
+    url = f"{dhis2_url}/api/organisationUnits?paging=false&fields=id,name,level,parent[id],path"
+    res = requests.get(url, headers=headers)
+    if res.ok:
+        units = res.json()["organisationUnits"]
+    return pd.DataFrame(units)
 
-@st.cache_data(show_spinner=True)
-def get_org_units(url, headers):
-    all_units = []
-    next_page = f"{url}/api/organisationUnits?paging=false&fields=id,name,level,parent[id],path"
-    r = requests.get(next_page, headers=headers)
-    r.raise_for_status()
-    all_units.extend(r.json().get("organisationUnits", []))
-    return all_units
+# --- Récupération des utilisateurs ---
+@st.cache_data(ttl=3600)
+def get_users():
+    users = []
+    url = f"{dhis2_url}/api/users?paging=false&fields=id,username,name,organisationUnits[id,name,path]"
+    res = requests.get(url, headers=headers)
+    if res.ok:
+        users = res.json()["users"]
+    return users
 
-@st.cache_data(show_spinner=True)
-def get_users(url, headers):
-    r = requests.get(f"{url}/api/users.json?paging=false&fields=id,username,name,organisationUnits[id]", headers=headers)
-    r.raise_for_status()
-    return r.json().get("users", [])
+if pat:
+    with st.spinner("🔄 Chargement des données..."):
+        org_df = get_org_units()
+        user_data = get_users()
 
-@st.cache_data(show_spinner=True)
-def get_user_logins(url, headers):
-    r = requests.get(f"{url}/api/userCredentials?fields=username,lastLogin&paging=false", headers=headers)
-    if r.status_code == 200:
-        return r.json().get("userCredentials", [])
-    return []
+        # Préparer les utilisateurs avec leurs unités
+        records = []
+        for user in user_data:
+            for ou in user.get("organisationUnits", []):
+                records.append({
+                    "user_id": user["id"],
+                    "username": user.get("username", ""),
+                    "name": user.get("name", ""),
+                    "orgunit_id": ou["id"],
+                    "orgunit_name": ou["name"],
+                    "path": ou["path"]
+                })
+        df_users = pd.DataFrame(records)
 
-if username and password:
-    headers = get_auth_header(username, password)
+        # Lier avec les niveaux et noms hiérarchiques
+        org_df = org_df.rename(columns={"id": "orgunit_id", "name": "orgunit_name"})
+        df = pd.merge(df_users, org_df[["orgunit_id", "level"]], on="orgunit_id", how="left")
 
-    with st.spinner("Chargement des unités d'organisation..."):
-        org_units = get_org_units(dhis2_url, headers)
-        org_df = pd.DataFrame(org_units)
+        # Doublons par nom
+        duplicated_names = df["name"].duplicated(keep=False)
+        df["doublon"] = duplicated_names
 
-    id_to_name = {row['id']: row['name'] for row in org_units}
-    id_to_level = {row['id']: row['level'] for row in org_units}
-    id_to_parent = {row['id']: row.get('parent', {}).get('id', None) for row in org_units}
-    id_to_path = {row['id']: row.get('path', '') for row in org_units}
+        # Extraire hiérarchie par niveau depuis le path
+        def extract_level(path, level):
+            parts = path.strip("/").split("/")
+            return parts[level - 1] if len(parts) >= level else None
 
-    unit_tree = defaultdict(list)
-    for ou in org_units:
-        parent_id = ou.get('parent', {}).get('id')
-        if parent_id:
-            unit_tree[parent_id].append(ou['id'])
+        for lvl in range(1, 7):
+            df[f"level_{lvl}_id"] = df["path"].apply(lambda x: extract_level(x, lvl))
 
-    st.sidebar.markdown("### 🎯 Sélection du niveau")
-    selected_level = st.sidebar.selectbox("Choisir un niveau à afficher :", [6, 5, 4, 3, 2, 1], index=1)
+        # Associer noms des niveaux supérieurs
+        for lvl in range(1, 7):
+            mapping = org_df[org_df["level"] == lvl].set_index("orgunit_id")["orgunit_name"].to_dict()
+            df[f"level_{lvl}_name"] = df[f"level_{lvl}_id"].map(mapping)
 
-    st.sidebar.markdown("### 📤 Charger et afficher les utilisateurs")
-    if st.sidebar.button("Charger les utilisateurs"):
-        with st.spinner("Chargement des utilisateurs..."):
-            users = get_users(dhis2_url, headers)
+        # Filtrage par région/district
+        st.sidebar.header("🔍 Filtres")
+        selected_regions = st.sidebar.multiselect("Filtrer par Région", options=df["level_2_name"].dropna().unique())
+        selected_districts = st.sidebar.multiselect("Filtrer par District", options=df["level_3_name"].dropna().unique())
 
-        org_users = defaultdict(list)
-        for user in users:
-            user_name = user.get('name', '')
-            user_username = user.get('username', '')
-            for org_unit in user.get('organisationUnits', []):
-                org_unit_id = org_unit['id']
-                if org_unit_id in id_to_name:
-                    org_users[org_unit_id].append({
-                        "Nom complet": user_name,
-                        "Nom de connexion": user_username
-                    })
+        if selected_regions:
+            df = df[df["level_2_name"].isin(selected_regions)]
+        if selected_districts:
+            df = df[df["level_3_name"].isin(selected_districts)]
 
-        agg_users = defaultdict(list)
-        for unit_id, user_list in org_users.items():
-            path = id_to_path.get(unit_id, '')
-            path_ids = path.strip('/').split('/')
-            for level_id in path_ids:
-                agg_users[level_id].extend(user_list)
+        # Agrégation pour le tableau croisé dynamique
+        grouped = df.groupby(["level_2_name", "level_3_name", "level_4_name", "level_5_name"]).agg(
+            total_utilisateurs=("username", "count"),
+            doublons=("doublon", "sum")
+        ).reset_index()
+        grouped["% Doublons"] = round((grouped["doublons"] / grouped["total_utilisateurs"]) * 100, 1)
 
-        data = []
-        for unit_id, user_list in agg_users.items():
-            level = id_to_level.get(unit_id, None)
-            if level and level <= 6 and level >= selected_level:
-                for user in user_list:
-                    data.append({
-                        "Nom complet": user.get("Nom complet", ""),
-                        "Nom de connexion": user.get("Nom de connexion", ""),
-                        "Unité d'organisation": id_to_name.get(unit_id, ""),
-                        "Niveau": level,
-                        "ID unité": unit_id
-                    })
+        st.success(f"{len(df)} utilisateurs chargés.")
+        st.dataframe(grouped, use_container_width=True)
 
-        df_users = pd.DataFrame(data).drop_duplicates()
-
-        st.success(f"{len(df_users)} utilisateurs trouvés à partir du niveau {selected_level}.")
-        st.dataframe(df_users, use_container_width=True)
-
-        csv = df_users.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📄 Télécharger au format CSV",
-            data=csv,
-            file_name=f"utilisateurs_dhis2_niveau_{selected_level}.csv",
-            mime='text/csv'
-        )
-
-    # Section Analyse activité
-    st.sidebar.markdown("### 🕵️‍♂️ Audit de Connexions")
-    start_date = st.sidebar.date_input("Date de début", datetime.today() - timedelta(days=30))
-    end_date = st.sidebar.date_input("Date de fin", datetime.today())
-
-    if start_date > end_date:
-        st.sidebar.error("❌ Date de début > date de fin.")
-    elif st.sidebar.button("Analyser les connexions"):
-        st.subheader("📊 Connexions des utilisateurs")
-        with st.spinner("Analyse des connexions..."):
-            login_data = get_user_logins(dhis2_url, headers)
-            df_logins = pd.DataFrame(login_data)
-            df_logins['lastLogin'] = pd.to_datetime(df_logins.get('lastLogin'), errors='coerce')
-
-            df_logins["Actif durant la période"] = df_logins['lastLogin'].apply(
-                lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
-            )
-
-            st.dataframe(df_logins.sort_values("lastLogin", ascending=False), use_container_width=True)
-
-            actifs = df_logins[df_logins["Actif durant la période"] == "Oui"]
-            if not actifs.empty:
-                excel_data = actifs.to_excel(index=False, engine='openpyxl')
-                st.download_button(
-                    label="📥 Télécharger les actifs (Excel)",
-                    data=excel_data,
-                    file_name="utilisateurs_actifs.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.info("Aucun utilisateur actif durant la période.")
+        # Export
+        csv = grouped.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Télécharger le rapport", csv, "rapport_utilisateurs_dhis2.csv", "text/csv")
 else:
-    st.warning("🔑 Veuillez renseigner vos identifiants DHIS2 pour commencer.")
+    st.info("Veuillez entrer le token personnel d'accès (PAT) pour continuer.")
