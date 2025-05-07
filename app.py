@@ -84,7 +84,7 @@ if username and password:
         selected_name = st.sidebar.selectbox("Choisir une unité", list(unit_options.keys()))
         selected_id = unit_options[selected_name]
 
-        if st.sidebar.button("📥 Charger les utilisateurs"):
+        if st.sidebar.button("📅 Charger les utilisateurs"):
             st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
             all_users = get_users(dhis2_url, headers)
             descendant_ids = get_descendants(dhis2_url, headers, selected_id)
@@ -130,6 +130,11 @@ if username and password:
         st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
         data = get_user_logins(dhis2_url, headers)
         df = pd.DataFrame(data)
+
+        # Correction ici : s'assurer que 'lastLogin' existe
+        if 'lastLogin' not in df.columns:
+            df['lastLogin'] = pd.NaT
+
         df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
 
         df['Actif durant la période'] = df['lastLogin'].apply(
@@ -142,7 +147,7 @@ if username and password:
         if not filtered.empty:
             excel_data = filtered.to_excel(index=False, engine='openpyxl')
             st.download_button(
-                "📤 Exporter les actifs (Excel)",
+                "📄 Exporter les actifs (Excel)",
                 data=excel_data,
                 file_name="utilisateurs_actifs.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
