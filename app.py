@@ -128,34 +128,56 @@ if username and password:
         st.sidebar.error("La date de début doit être antérieure à la date de fin.")
     elif st.sidebar.button("📈 Analyser l'activité"):
         st.subheader("🔍 Audit d'activité des utilisateurs DHIS2")
-        data = get_user_logins(dhis2_url, headers)
-        df = pd.DataFrame(data)
 
-        # Vérification existence de la colonne 'lastLogin'
-        if 'lastLogin' not in df.columns:
-            st.warning("Aucune donnée de connexion disponible (lastLogin manquant).")
-        else:
-            df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+        users_data = get_users(dhis2_url, headers)
+        logins_data = get_user_logins(dhis2_url, headers)
 
-            df['Actif durant la période'] = df['lastLogin'].apply(
-                lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
-            )
+        df_users = pd.DataFrame(users_data)[['username', 'name']]
+        df_logins = pd.DataFrame(logins_data)[['username', 'lastLogin']]
 
-            nb_connus = df['lastLogin'].notnull().sum()
-            st.write(f"🔢 Nombre d'utilisateurs avec une date de connexion connue : {nb_connus}")
+        df = pd.merge(df_users, df_logins, on='username', how='left')
+        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
 
-            st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+        df['Actif durant la période'] = df['lastLogin'].apply(
+            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
+        )
 
-            filtered = df[df["Actif durant la période"] == "Oui"]
-            if not filtered.empty:
-                excel_data = filtered.to_excel(index=False, engine='openpyxl')
+        df['Jamais connecté'] = df['lastLogin'].isna().map({True: "Oui", False: "Non"})
+
+        nb_connus = df['lastLogin'].notnull().sum()
+        st.write(f"🔢 Nombre d'utilisateurs avec une date de connexion connue : {nb_connus}")
+
+        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+
+        actifs = df[df["Actif durant la période"] == "Oui"]
+        jamais_connectes = df[df["Jamais connecté"] == "Oui"]
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("### 📤 Export utilisateurs actifs")
+            if not actifs.empty:
+                csv_actifs = actifs.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    "📤 Exporter les actifs (Excel)",
-                    data=excel_data,
-                    file_name="utilisateurs_actifs.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    "📥 Télécharger les actifs",
+                    data=csv_actifs,
+                    file_name="utilisateurs_actifs.csv",
+                    mime="text/csv"
                 )
             else:
                 st.info("Aucun utilisateur actif trouvé durant la période.")
+
+        with col2:
+            st.write("### 🚫 Export jamais connectés")
+            if not jamais_connectes.empty:
+                csv_jamais = jamais_connectes.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "📥 Télécharger les jamais connectés",
+                    data=csv_jamais,
+                    file_name="utilisateurs_jamais_connectes.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("Tous les utilisateurs se sont déjà connectés au moins une fois.")
 else:
     st.warning("Veuillez renseigner vos identifiants DHIS2 pour commencer.")
